@@ -1,0 +1,160 @@
+Attribute VB_Name = "MigrationRunner"
+Option Compare Database
+Option Explicit
+
+' Run this module only from Migration_FE.accdb after old_ tables are linked
+' to the populated legacy database and new_ tables are linked to v2.
+
+Public Sub PrepareMigration()
+    EnsureSupportTables
+    SeedStaffNameMap
+    MsgBox "Preparation complete. Open StaffNameMap, fill in EmployeeEmail for each old staff name, then run RunCoreMigration.", vbInformation
+End Sub
+
+Public Sub RunCoreMigration()
+    Dim db As DAO.Database
+    Dim moved As Long
+
+    If MsgBox("This appends data to the new v2 databases. Confirm that backups were made and preview queries were reviewed.", vbYesNo + vbExclamation, "Run core migration") <> vbYes Then Exit Sub
+    Set db = CurrentDb
+    EnsureSupportTables
+
+    moved = ExecuteAppend(db, "Location", _
+        "INSERT INTO new_Location (LocationCode, LocationName, Address, County) " & _
+        "SELECT O.[Abbreviation], O.[Name], O.[Address], O.[County] " & _
+        "FROM old_Locations AS O LEFT JOIN new_Location AS N ON O.[Abbreviation]=N.LocationCode " & _
+        "WHERE O.[Abbreviation] Is Not Null AND N.LocationCode Is Null")
+
+    moved = moved + ExecuteAppend(db, "Employee", _
+        "INSERT INTO new_Employee (EmployeeEmail, FirstName, LastName, MiddleInitial, HireDate, Active) " & _
+        "SELECT O.[Email], O.[FirstName], O.[LastName], O.[MI], O.[HireDate], True " & _
+        "FROM old_Employees AS O LEFT JOIN new_Employee AS N ON O.[Email]=N.EmployeeEmail " & _
+        "WHERE O.[Email] Is Not Null AND N.EmployeeEmail Is Null")
+
+    moved = moved + ExecuteAppend(db, "EmployeeRole", _
+        "INSERT INTO new_EmployeeRole (EmployeeEmail, RoleName) " & _
+        "SELECT O.[EmployeeEmail], O.[Role] FROM old_EmployeeRole AS O " & _
+        "WHERE O.[EmployeeEmail] Is Not Null AND NOT EXISTS " & _
+        "(SELECT * FROM new_EmployeeRole AS N WHERE N.EmployeeEmail=O.[EmployeeEmail] AND N.RoleName=O.[Role])")
+
+    moved = moved + ExecuteAppend(db, "EmployeeLocation", _
+        "INSERT INTO new_EmployeeLocation (EmployeeEmail, LocationCode) " & _
+        "SELECT O.[EmployeeEmail], L.LocationCode FROM old_EmployeeLocation AS O " & _
+        "INNER JOIN new_Location AS L ON O.[LocationName]=L.LocationName " & _
+        "WHERE O.[EmployeeEmail] Is Not Null AND NOT EXISTS " & _
+        "(SELECT * FROM new_EmployeeLocation AS N WHERE N.EmployeeEmail=O.[EmployeeEmail] AND N.LocationCode=L.LocationCode)")
+
+    moved = moved + ExecuteAppend(db, "Clinic", _
+        "INSERT INTO new_Clinic (ClinicCode, ClinicName, LocationCode) " & _
+        "SELECT O.[ClinicName], O.[ClinicName], L.LocationCode FROM old_Clinics AS O " & _
+        "LEFT JOIN new_Location AS L ON O.[LocationName]=L.LocationName " & _
+        "WHERE O.[ClinicName] Is Not Null AND NOT EXISTS (SELECT * FROM new_Clinic AS N WHERE N.ClinicCode=O.[ClinicName])")
+
+    moved = moved + ExecuteAppend(db, "FrameCatalog", _
+        "INSERT INTO new_FrameCatalog (SKU, FrameName, Material, Color, Manufacturer, Discontinued) " & _
+        "SELECT O.[SKU], O.[Frame Name], O.[Material], O.[Color], O.[Manufacturer], O.[Discontinued] " & _
+        "FROM old_FrameList AS O LEFT JOIN new_FrameCatalog AS N ON O.[SKU]=N.SKU " & _
+        "WHERE O.[SKU] Is Not Null AND N.SKU Is Null")
+
+    moved = moved + ExecuteAppend(db, "FiscalMonth", _
+        "INSERT INTO new_FiscalMonth (MonthStart, FiscalYear, Label) " & _
+        "SELECT O.[MonthStart], O.[FiscalYear], O.[Label] FROM old_tblFiscalMonths AS O " & _
+        "WHERE O.[MonthStart] Is Not Null AND NOT EXISTS (SELECT * FROM new_FiscalMonth AS N WHERE N.MonthStart=O.[MonthStart])")
+
+    moved = moved + ExecuteAppend(db, "Consult", _
+        "INSERT INTO new_Consult (ConsultNumber, PatientDisplay, Last5, CreatedDate, ServiceName, ConsultStatus, County, Urgency, OrderingProvider, LastAction, LastActionDate, AppointmentDate, AppointmentClinic, ContactAttempts, LetterSentDate, LastContactDate, DocumentationRequests) " & _
+        "SELECT O.[Consult#], O.[Patient], O.[Last 5], O.[Created Date], O.[Service], O.[Status], O.[County], O.[Urgency], O.[Ordering Provider], O.[Last Action], O.[Last Action Date], O.[Appt Date], O.[Appt Clinic], O.[Contact Attempts Made], O.[Letter Sent Date], O.[Last Contact Attempt], O.[Doc Requests] " & _
+        "FROM old_ConsultTracking AS O LEFT JOIN new_Consult AS N ON O.[Consult#]=N.ConsultNumber " & _
+        "WHERE O.[Consult#] Is Not Null AND N.ConsultNumber Is Null")
+
+    moved = moved + ExecuteAppend(db, "JobOrder", _
+        "INSERT INTO new_JobOrder (ConsultNumber, OrderDate, PONumber, LocationCode, County, FrameName, LensDescription, ClosedDate) " & _
+        "SELECT O.[ConsultNumber], O.[OrderDate], O.[PONumber], O.[LocationCode], O.[County], O.[FrameName], O.[LensDescription], O.[DateShipped] " & _
+        "FROM old_tblJobTracking AS O LEFT JOIN new_JobOrder AS N ON O.[ConsultNumber]=N.ConsultNumber " & _
+        "WHERE O.[ConsultNumber] Is Not Null AND N.JobOrderID Is Null")
+
+    moved = moved + ExecuteAppend(db, "ShipmentTracking", _
+        "INSERT INTO new_ShipmentTracking (JobOrderID, ShippedDate, TrackingNumber, FrameName, LensDescription) " & _
+        "SELECT J.JobOrderID, S.[Date Shipped], S.[Tracking Number], S.[Frame Name], S.[Lens Description] " & _
+        "FROM [old_Shipping Report] AS S INNER JOIN new_JobOrder AS J ON S.[Consult Number]=J.ConsultNumber " & _
+        "WHERE S.[Date Shipped] Is Not Null AND NOT EXISTS " & _
+        "(SELECT * FROM new_ShipmentTracking AS T WHERE T.JobOrderID=J.JobOrderID AND Nz(T.TrackingNumber,'')=Nz(S.[Tracking Number],''))")
+
+    MoveWorkload db
+    MoveHours db
+    MoveQuality db
+    MoveRemakes db
+    MoveRecognition db
+    MsgBox "Core migration complete. " & moved & " rows were appended by the core steps. Review MigrationRunLog and MigrationIssue before using the new database.", vbInformation
+End Sub
+
+Private Sub MoveWorkload(ByVal db As DAO.Database)
+    ExecuteAppend db, "EmployeeWorkload", _
+        "INSERT INTO new_EmployeeWorkload (WorkDate, EmployeeEmail, ClinicCode, LocationCode, ActivityCount) " & _
+        "SELECT O.[Date], M.EmployeeEmail, O.[ClinicName], O.[LocationName], O.[ActivityCount] " & _
+        "FROM old_EmployeeWorkload AS O INNER JOIN StaffNameMap AS M ON O.[StaffName]=M.OldStaffName " & _
+        "WHERE M.EmployeeEmail Is Not Null AND NOT EXISTS " & _
+        "(SELECT * FROM new_EmployeeWorkload AS W WHERE W.WorkDate=O.[Date] AND W.EmployeeEmail=M.EmployeeEmail AND Nz(W.ClinicCode,'')=Nz(O.[ClinicName],'') AND W.ActivityCount=O.[ActivityCount])"
+    LogUnmappedStaff db, "EmployeeWorkload", "StaffName", "old_EmployeeWorkload"
+End Sub
+
+Private Sub MoveHours(ByVal db As DAO.Database)
+    ExecuteAppend db, "EmployeeHours", _
+        "INSERT INTO new_EmployeeHours (PayPeriod, PayPeriodEnd, EmployeeEmail, NonLeaveHours) " & _
+        "SELECT O.[PayPeriod], O.[PPEnd Date], M.EmployeeEmail, O.[Non-Leave Hours Worked] " & _
+        "FROM [old_Optician Hours Worked] AS O INNER JOIN StaffNameMap AS M ON O.[Employee]=M.OldStaffName " & _
+        "WHERE M.EmployeeEmail Is Not Null"
+    LogUnmappedStaff db, "Optician Hours Worked", "Employee", "[old_Optician Hours Worked]"
+End Sub
+
+Private Sub MoveQuality(ByVal db As DAO.Database)
+    ExecuteAppend db, "QualityException", _
+        "INSERT INTO new_QualityException (PONumber, NotificationDate, EmployeeEmail, LocationCode, ErrorDescription, EmployeeCaused, CompletedDate, Response) " & _
+        "SELECT E.[PO#], E.[NotificationDateFromLab], E.[EmployeeEmail], E.[LocationName], E.[Error], C.[EmployeeCaused], E.[DateCompleted], E.[Response] " & _
+        "FROM old_Exceptions AS E LEFT JOIN old_EmployeeCausedExceptions AS C ON E.[PO#]=C.[PO#] " & _
+        "WHERE NOT EXISTS (SELECT * FROM new_QualityException AS N WHERE Nz(N.PONumber,'')=Nz(E.[PO#],'') AND N.NotificationDate=E.[NotificationDateFromLab])"
+End Sub
+
+Private Sub MoveRemakes(ByVal db As DAO.Database)
+    ExecuteAppend db, "Remake", _
+        "INSERT INTO new_Remake (OriginalPONumber, NewPONumber, RemakeDate, OriginalLocation, RemakeLocation, Reason, Description) " & _
+        "SELECT [Original PO Number], [New PO Number], [Remake Date], [Original Location], [Remake Location], [Reason], [Description] FROM old_Remakes " & _
+        "WHERE NOT EXISTS (SELECT * FROM new_Remake AS N WHERE Nz(N.OriginalPONumber,'')=Nz(old_Remakes.[Original PO Number],'') AND N.RemakeDate=old_Remakes.[Remake Date])"
+End Sub
+
+Private Sub MoveRecognition(ByVal db As DAO.Database)
+    ExecuteAppend db, "Awards", "INSERT INTO new_RecognitionFeedback (FeedbackType, FeedbackDate, EmployeeEmail, Description) SELECT 'Award',[Award Date],[Employee Email],[Award] FROM old_Awards"
+    ExecuteAppend db, "Complaints", "INSERT INTO new_RecognitionFeedback (FeedbackType, FeedbackDate, EmployeeEmail, Description, GivenBy) SELECT 'Complaint',[DateOfComplaint],[EmployeeEmail],[DescriptionOfComplaint],[ComplaintBy] FROM old_Complaints"
+    ExecuteAppend db, "Compliments", "INSERT INTO new_RecognitionFeedback (FeedbackType, FeedbackDate, EmployeeEmail, Description, GivenBy) SELECT 'Compliment',[DateOfCompliment],[EmployeeEmail],[DescriptionOfCompliment],[NominatedBy] FROM old_ComplimentsFromVeterans"
+    ExecuteAppend db, "Kudos", "INSERT INTO new_RecognitionFeedback (FeedbackType, FeedbackDate, EmployeeEmail, Description, GivenBy) SELECT 'Kudos',K.[Date of Kudos],B.[EmployeeEmail],K.[Description],K.[Given By] FROM old_Kudos AS K INNER JOIN old_KudosEmployeeEmails AS B ON K.[KudosID]=B.[KudosID]"
+    ExecuteAppend db, "Commendations", "INSERT INTO new_RecognitionFeedback (FeedbackType, FeedbackDate, EmployeeEmail, Description, GivenBy) SELECT 'Commendation',[Date of Comendation],[Employee Email],[Description],[Given By] FROM [old_Veteran Commendations]"
+End Sub
+
+Private Function ExecuteAppend(ByVal db As DAO.Database, ByVal stepName As String, ByVal sql As String) As Long
+    On Error GoTo Failed
+    db.Execute sql, dbFailOnError
+    ExecuteAppend = db.RecordsAffected
+    db.Execute "INSERT INTO MigrationRunLog (RunAt, QueryName, Notes) VALUES (Now(), '" & Replace(stepName, "'", "''") & "', 'Appended " & ExecuteAppend & " row(s)')"
+    Exit Function
+Failed:
+    db.Execute "INSERT INTO MigrationRunLog (RunAt, QueryName, Notes) VALUES (Now(), '" & Replace(stepName, "'", "''") & "', 'FAILED: " & Replace(Err.Description, "'", "''") & "')"
+    Err.Raise Err.Number, "MigrationRunner." & stepName, Err.Description
+End Function
+
+Private Sub EnsureSupportTables()
+    Dim db As DAO.Database: Set db = CurrentDb
+    On Error Resume Next
+    db.Execute "CREATE TABLE StaffNameMap (OldStaffName TEXT(255) CONSTRAINT PK_StaffNameMap PRIMARY KEY, EmployeeEmail TEXT(255))"
+    db.Execute "CREATE TABLE MigrationIssue (IssueID AUTOINCREMENT CONSTRAINT PK_MigrationIssue PRIMARY KEY, SourceTable TEXT(100), SourceValue TEXT(255), IssueText LONGTEXT)"
+    On Error GoTo 0
+End Sub
+
+Private Sub SeedStaffNameMap()
+    Dim db As DAO.Database: Set db = CurrentDb
+    db.Execute "INSERT INTO StaffNameMap (OldStaffName) SELECT DISTINCT [StaffName] FROM old_EmployeeWorkload WHERE [StaffName] Is Not Null AND NOT EXISTS (SELECT * FROM StaffNameMap WHERE StaffNameMap.OldStaffName=old_EmployeeWorkload.[StaffName])", dbFailOnError
+    db.Execute "INSERT INTO StaffNameMap (OldStaffName) SELECT DISTINCT [Employee] FROM [old_Optician Hours Worked] WHERE [Employee] Is Not Null AND NOT EXISTS (SELECT * FROM StaffNameMap WHERE StaffNameMap.OldStaffName=[old_Optician Hours Worked].[Employee])", dbFailOnError
+End Sub
+
+Private Sub LogUnmappedStaff(ByVal db As DAO.Database, ByVal sourceLabel As String, ByVal nameField As String, ByVal sourceTable As String)
+    db.Execute "INSERT INTO MigrationIssue (SourceTable, SourceValue, IssueText) SELECT '" & sourceLabel & "', S.[" & nameField & "], 'No EmployeeEmail selected in StaffNameMap' FROM " & sourceTable & " AS S LEFT JOIN StaffNameMap AS M ON S.[" & nameField & "]=M.OldStaffName WHERE S.[" & nameField & "] Is Not Null AND M.EmployeeEmail Is Null", dbFailOnError
+End Sub
