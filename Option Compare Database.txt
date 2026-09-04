@@ -1,0 +1,510 @@
+Option Compare Database
+Option Explicit
+
+' Daily full-snapshot importer for OpticalAdmin_FE.
+' Exact workbook tabs: CTM, InProcess, Tracking, Shipping.
+' The four stgDaily tables are replaced each import and remain available to browse.
+
+Private Const T_CTM As String = "stgDailyCTM"
+Private Const T_INPROCESS As String = "stgDailyInProcess"
+Private Const T_TRACKING As String = "stgDailyTracking"
+Private Const T_SHIPPING As String = "stgDailyShipping"
+
+Public Function JT_SmokeTest() As Boolean
+    ' Calling this from automation forces Access to compile the entire module.
+    JT_SmokeTest = True
+End Function
+
+Public Function JT_Install() As Boolean
+    On Error GoTo Failed
+    EnsureControlTables CurrentDb
+    Application.SetOption "Auto Compact", True
+    JT_Install = True
+    MsgBox "Daily JobTracking tools are installed. Open frmDailyJobTracking to begin.", vbInformation
+    Exit Function
+Failed:
+    MsgBox "Install failed: " & Err.Number & " - " & Err.Description, vbCritical
+End Function
+
+Public Function JT_ImportSnapshot() As Boolean
+    Dim sourceFile As String, db As DAO.Database, runID As Long
+    On Error GoTo Failed
+    sourceFile = PickWorkbook()
+    If Len(sourceFile) = 0 Then Exit Function
+    DoCmd.Hourglass True
+    SysCmd acSysCmdSetStatus, "Removing the previous staging snapshot..."
+    Set db = CurrentDb
+    EnsureControlTables db
+    DropTableIfExists db, T_CTM
+    DropTableIfExists db, T_INPROCESS
+    DropTableIfExists db, T_TRACKING
+    DropTableIfExists db, T_SHIPPING
+    DropWorkTables db
+    SysCmd acSysCmdSetStatus, "Importing CTM..."
+    ImportSheet sourceFile, "CTM", T_CTM
+    SysCmd acSysCmdSetStatus, "Importing InProcess..."
+    ImportSheet sourceFile, "InProcess", T_INPROCESS
+    SysCmd acSysCmdSetStatus, "Importing Tracking..."
+    ImportSheet sourceFile, "Tracking", T_TRACKING
+    SysCmd acSysCmdSetStatus, "Importing Shipping. This is the largest sheet..."
+    ImportSheet sourceFile, "Shipping", T_SHIPPING
+    Set db = CurrentDb
+    ValidateSnapshot db
+    runID = CreateRun(db, sourceFile, "Validated")
+    AddUsefulStageIndexes db
+    DoCmd.Hourglass False
+    SysCmd acSysCmdClearStatus
+    JT_ImportSnapshot = True
+    MsgBox "The full snapshot is staged and validated." & vbCrLf & vbCrLf & _
+           Format(RowCount(db, T_CTM), "#,##0") & " CTM rows" & vbCrLf & _
+           Format(RowCount(db, T_INPROCESS), "#,##0") & " InProcess rows" & vbCrLf & _
+           Format(RowCount(db, T_TRACKING), "#,##0") & " Tracking rows" & vbCrLf & _
+           Format(RowCount(db, T_SHIPPING), "#,##0") & " Shipping rows" & vbCrLf & vbCrLf & _
+           "Review the staged tables, then select Commit Snapshot.", vbInformation
+    Exit Function
+Failed:
+    DoCmd.Hourglass False
+    SysCmd acSysCmdClearStatus
+    MsgBox "Snapshot import stopped: " & Err.Number & " - " & Err.Description, vbCritical
+End Function
+
+Public Function JT_CommitSnapshot() As Boolean
+    JT_CommitSnapshot = CommitSnapshotCore(False)
+End Function
+
+Private Function CommitSnapshotCore(ByVal silentMode As Boolean) As Boolean
+    Dim db As DAO.Database, runID As Long
+    Dim sourceRows As Long, acceptedRows As Long, rejectedRows As Long
+    Dim savedNumber As Long, savedDescription As String
+    On Error GoTo Failed
+    Set db = CurrentDb
+    EnsureControlTables db
+    ValidateSnapshot db
+    runID = LatestValidatedRun(db)
+    If runID = 0 Then Err.Raise vbObjectError + 1200, , "Import and validate a workbook before committing."
+    If Not silentMode Then
+        If MsgBox("Commit the staged snapshot to the linked Operations back end?" & vbCrLf & _
+                  "Only new or changed records will be written.", vbYesNo + vbQuestion) <> vbYes Then Exit Function
+    End If
+
+    DoCmd.Hourglass True
+    SysCmd acSysCmdSetStatus, "Creating a dated Operations backup..."
+    BackupOperationsBackend db
+    SysCmd acSysCmdSetStatus, "Checking Operations table compatibility..."
+    EnsureOperationsCompatibility db
+    SysCmd acSysCmdSetStatus, "Preparing indexed work tables..."
+    PrepareWorkTables db
+    sourceRows = RowCount(db, T_CTM) + RowCount(db, T_INPROCESS) + RowCount(db, T_TRACKING) + RowCount(db, T_SHIPPING)
+
+    SysCmd acSysCmdSetStatus, "Updating consults..."
+    acceptedRows = acceptedRows + CommitConsults(db)
+    SysCmd acSysCmdSetStatus, "Updating job orders..."
+    acceptedRows = acceptedRows + CommitJobOrders(db)
+    SysCmd acSysCmdSetStatus, "Publishing new shipping and tracking records..."
+    acceptedRows = acceptedRows + CommitShipments(db)
+    WriteAudit db, runID, sourceRows, acceptedRows, rejectedRows
+    UpdateRun db, runID, "Committed", "Full snapshot committed with bulk indexed queries."
+
+    DoCmd.Hourglass False
+    SysCmd acSysCmdClearStatus
+    CommitSnapshotCore = True
+    If Not silentMode Then
+        MsgBox "Snapshot committed successfully." & vbCrLf & _
+               Format(acceptedRows, "#,##0") & " records were inserted or updated." & vbCrLf & _
+               "The staged tables remain available for review.", vbInformation
+    End If
+    Exit Function
+Failed:
+    savedNumber = Err.Number: savedDescription = Err.Description
+    On Error Resume Next
+    UpdateRun db, runID, "Failed", CStr(savedNumber) & " - " & savedDescription
+    DoCmd.Hourglass False
+    SysCmd acSysCmdClearStatus
+    If silentMode Then
+        Err.Raise savedNumber, , savedDescription
+    Else
+        MsgBox "Commit stopped: " & savedNumber & " - " & savedDescription & vbCrLf & vbCrLf & _
+               "A dated Operations backup was created before writing. After correcting the problem, this same snapshot can be safely committed again.", vbCritical
+    End If
+End Function
+
+Public Function JT_ClearStaging() As Boolean
+    Dim db As DAO.Database
+    If MsgBox("Remove the four staged snapshot tables and temporary work tables?" & vbCrLf & _
+              "Shared back-end data will not be deleted.", vbYesNo + vbExclamation) <> vbYes Then Exit Function
+    Set db = CurrentDb
+    DropTableIfExists db, T_CTM
+    DropTableIfExists db, T_INPROCESS
+    DropTableIfExists db, T_TRACKING
+    DropTableIfExists db, T_SHIPPING
+    DropWorkTables db
+    JT_ClearStaging = True
+    MsgBox "Staging was removed. Close the front end to allow Auto Compact to reclaim the space.", vbInformation
+End Function
+
+Public Function JT_OpenTable(ByVal tableName As String) As Boolean
+    On Error GoTo Failed
+    DoCmd.OpenTable tableName, acViewNormal, acReadOnly
+    JT_OpenTable = True
+    Exit Function
+Failed:
+    MsgBox tableName & " is not available. Import a snapshot first.", vbExclamation
+End Function
+
+Public Function JT_OpenImportHistory() As Boolean
+    DoCmd.OpenTable "ImportRun", acViewNormal, acReadOnly
+    JT_OpenImportHistory = True
+End Function
+
+Private Function PickWorkbook() As String
+    With Application.FileDialog(3)
+        .Title = "Select the JobTracking workbook"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "Excel workbooks", "*.xlsx;*.xlsm;*.xls"
+        If .Show Then PickWorkbook = .SelectedItems(1)
+    End With
+End Function
+
+Private Sub ImportSheet(ByVal sourceFile As String, ByVal sheetName As String, ByVal targetTable As String)
+    On Error GoTo Failed
+    DoCmd.TransferSpreadsheet acImport, acSpreadsheetTypeExcel12Xml, targetTable, sourceFile, True, sheetName & "$"
+    Exit Sub
+Failed:
+    Err.Raise vbObjectError + 1201, , "Could not import the '" & sheetName & "' sheet. " & Err.Description
+End Sub
+
+Private Sub ValidateSnapshot(ByVal db As DAO.Database)
+    RequireTable db, T_CTM
+    RequireTable db, T_INPROCESS
+    RequireTable db, T_TRACKING
+    RequireTable db, T_SHIPPING
+    RequireField db, T_CTM, "Consult#"
+    RequireField db, T_INPROCESS, "PO"
+    RequireField db, T_INPROCESS, "Order Date"
+    RequireField db, T_TRACKING, "PO"
+    RequireField db, T_TRACKING, "Ship Date"
+    RequireField db, T_SHIPPING, "P#O#"
+    RequireField db, T_SHIPPING, "Date Shipped"
+    If RowCount(db, T_CTM) = 0 Then Err.Raise vbObjectError + 1202, , "CTM contains no data rows."
+    If RowCount(db, T_INPROCESS) = 0 Then Err.Raise vbObjectError + 1203, , "InProcess contains no data rows."
+    If RowCount(db, T_SHIPPING) = 0 Then Err.Raise vbObjectError + 1204, , "Shipping contains no data rows."
+End Sub
+
+Private Sub EnsureControlTables(ByVal db As DAO.Database)
+    If Not TableExists(db, "ImportRun") Then
+        db.Execute "CREATE TABLE ImportRun (ImportRunID AUTOINCREMENT CONSTRAINT PK_ImportRun PRIMARY KEY, ImportStarted DATETIME, SourceFile TEXT(255), Status TEXT(30), CTMRows LONG, InProcessRows LONG, TrackingRows LONG, ShippingRows LONG, Notes LONGTEXT)", dbFailOnError
+    End If
+    If Not TableExists(db, "ImportIssue") Then
+        db.Execute "CREATE TABLE ImportIssue (ImportIssueID AUTOINCREMENT CONSTRAINT PK_ImportIssue PRIMARY KEY, ImportRunID LONG, Severity TEXT(20), SourceSheet TEXT(30), SourceKey TEXT(100), IssueText LONGTEXT)", dbFailOnError
+    End If
+End Sub
+
+Private Function CreateRun(ByVal db As DAO.Database, ByVal sourceFile As String, ByVal statusText As String) As Long
+    Dim rs As DAO.Recordset
+    db.Execute "INSERT INTO ImportRun (ImportStarted,SourceFile,Status,CTMRows,InProcessRows,TrackingRows,ShippingRows,Notes) VALUES (Now(),'" & _
+               SqlText(sourceFile) & "','" & SqlText(statusText) & "'," & RowCount(db, T_CTM) & "," & RowCount(db, T_INPROCESS) & "," & _
+               RowCount(db, T_TRACKING) & "," & RowCount(db, T_SHIPPING) & ",'Full daily snapshot')", dbFailOnError
+    Set rs = db.OpenRecordset("SELECT @@IDENTITY AS NewID", dbOpenSnapshot)
+    CreateRun = CLng(rs!NewID)
+    rs.Close
+End Function
+
+Private Function LatestValidatedRun(ByVal db As DAO.Database) As Long
+    LatestValidatedRun = Nz(DMax("ImportRunID", "ImportRun", "Status='Validated' OR Status='Failed'"), 0)
+End Function
+
+Private Sub BackupOperationsBackend(ByVal db As DAO.Database)
+    Dim sourcePath As String, rootPath As String, backupFolder As String, backupPath As String
+    Dim marker As Long, fso As Object
+    sourcePath = db.TableDefs("JobOrder").Connect
+    If UCase$(Left$(sourcePath, 10)) = ";DATABASE=" Then sourcePath = Mid$(sourcePath, 11)
+    marker = InStr(1, sourcePath, "\BackEnds\", vbTextCompare)
+    If marker = 0 Then Err.Raise vbObjectError + 1220, , "Could not determine the Operations back-end root from the JobOrder link."
+    rootPath = Left$(sourcePath, marker - 1)
+    backupFolder = rootPath & "\Backups\Ops"
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(rootPath & "\Backups") Then fso.CreateFolder rootPath & "\Backups"
+    If Not fso.FolderExists(backupFolder) Then fso.CreateFolder backupFolder
+    backupPath = backupFolder & "\OpticalOps_BE_before_import_" & Format(Now(), "yyyymmdd_hhnnss") & ".accdb"
+    FileCopy sourcePath, backupPath
+End Sub
+
+Private Sub EnsureOperationsCompatibility(ByVal db As DAO.Database)
+    Dim ops As DAO.Database, sourcePath As String
+    sourcePath = OperationsBackendPath(db)
+    Set ops = DBEngine.OpenDatabase(sourcePath, False)
+    ' Daily source files do not contain a Consult number for new PO records.
+    ' The relationship is populated later when a verified mapping is available.
+    ops.TableDefs("JobOrder").Fields("ConsultNumber").Required = False
+    If Not ExternalFieldExists(ops, "ShipmentTracking", "JobOrderKey") Then
+        ops.Execute "ALTER TABLE ShipmentTracking ADD COLUMN JobOrderKey LONG", dbFailOnError
+    End If
+    On Error Resume Next
+    ops.Execute "CREATE INDEX IX_ShipmentTracking_LegacyPO ON ShipmentTracking (JobOrderID)"
+    On Error GoTo 0
+    ops.Close
+    db.TableDefs("Consult").RefreshLink
+    db.TableDefs("JobOrder").RefreshLink
+    db.TableDefs("ShipmentTracking").RefreshLink
+    db.TableDefs("ImportAudit").RefreshLink
+End Sub
+
+Private Function OperationsBackendPath(ByVal db As DAO.Database) As String
+    OperationsBackendPath = db.TableDefs("JobOrder").Connect
+    If UCase$(Left$(OperationsBackendPath, 10)) = ";DATABASE=" Then OperationsBackendPath = Mid$(OperationsBackendPath, 11)
+End Function
+
+Private Function ExternalFieldExists(ByVal db As DAO.Database, ByVal tableName As String, ByVal fieldName As String) As Boolean
+    On Error Resume Next
+    ExternalFieldExists = (Len(db.TableDefs(tableName).Fields(fieldName).Name) > 0)
+    On Error GoTo 0
+End Function
+
+Private Sub UpdateRun(ByVal db As DAO.Database, ByVal runID As Long, ByVal statusText As String, ByVal notesText As String)
+    If runID = 0 Then Exit Sub
+    db.Execute "UPDATE ImportRun SET Status='" & SqlText(statusText) & "', Notes='" & SqlText(notesText) & "' WHERE ImportRunID=" & runID, dbFailOnError
+End Sub
+
+Private Sub AddUsefulStageIndexes(ByVal db As DAO.Database)
+    On Error Resume Next
+    db.Execute "CREATE INDEX IX_stgCTM_Consult ON [" & T_CTM & "] ([Consult#])"
+    db.Execute "CREATE INDEX IX_stgInProcess_PO ON [" & T_INPROCESS & "] ([PO])"
+    db.Execute "CREATE INDEX IX_stgTracking_PO ON [" & T_TRACKING & "] ([PO])"
+    db.Execute "CREATE INDEX IX_stgShipping_PO ON [" & T_SHIPPING & "] ([P#O#])"
+    On Error GoTo 0
+End Sub
+
+Private Sub PrepareWorkTables(ByVal db As DAO.Database)
+    DropWorkTables db
+    BuildConsultWork db
+    BuildJobWork db
+    BuildShipmentWork db
+End Sub
+
+Private Sub BuildConsultWork(ByVal db As DAO.Database)
+    db.Execute "CREATE TABLE tmpConsultSource (ConsultNumber LONG CONSTRAINT PK_tmpConsultSource PRIMARY KEY, PatientDisplay TEXT(255), Last5 TEXT(20), CreatedDate DATETIME, ServiceName TEXT(100), ConsultStatus TEXT(50), County TEXT(100), Urgency TEXT(50), OrderingProvider TEXT(255), LastAction TEXT(255), LastActionDate DATETIME, AppointmentDate DATETIME, AppointmentClinic TEXT(255), ContactAttempts LONG, LetterSentDate DATETIME, LastContactDate DATETIME, DocumentationRequests LONG)", dbFailOnError
+    db.Execute "INSERT INTO tmpConsultSource (ConsultNumber,PatientDisplay,Last5,CreatedDate,ServiceName,ConsultStatus,County,Urgency,OrderingProvider,LastAction,LastActionDate,AppointmentDate,AppointmentClinic,ContactAttempts,LetterSentDate,LastContactDate,DocumentationRequests) " & _
+               "SELECT CLng([Consult#]), Max([Patient]), Max([Last 5]), Max([Created Date]), Max([Service]), Max([Status]), Max([County]), Max([Urgency]), Max([Ordering Provider]), Max([Last Action]), Max([Last Action Date]), Max([Appt Date]), Max([Appt Clinic]), Max(Nz([Contact Attempts Made],0)), Max([Letter Sent Date]), Max([Last Contact Attempt]), Max(Nz([Doc Requests],0)) " & _
+               "FROM [" & T_CTM & "] WHERE [Consult#] Is Not Null GROUP BY CLng([Consult#])", dbFailOnError
+    db.Execute "CREATE TABLE tmpConsultKey (ConsultNumber LONG CONSTRAINT PK_tmpConsultKey PRIMARY KEY)", dbFailOnError
+    db.Execute "INSERT INTO tmpConsultKey (ConsultNumber) SELECT ConsultNumber FROM Consult WHERE ConsultNumber Is Not Null", dbFailOnError
+End Sub
+
+Private Sub BuildJobWork(ByVal db As DAO.Database)
+    db.Execute "CREATE TABLE tmpJobSource (PONumber TEXT(50) CONSTRAINT PK_tmpJobSource PRIMARY KEY, ConsultNumber LONG, OrderDate DATETIME, LocationCode TEXT(20), JobStatus TEXT(40))", dbFailOnError
+    db.Execute "INSERT INTO tmpJobSource (PONumber,ConsultNumber,OrderDate,LocationCode,JobStatus) " & _
+               "SELECT Left(Trim(Nz([PO],'')),50), Max(IIf(IsNumeric([Consult]),CLng(Val([Consult])),Null)), Min([Order Date]), Left(Max(Nz([Facility],'')),20), Left(Max(Nz([Station Status],'In Process')),40) " & _
+               "FROM [" & T_INPROCESS & "] WHERE Len(Trim(Nz([PO],'')))>0 GROUP BY Left(Trim(Nz([PO],'')),50)", dbFailOnError
+    RebuildJobKey db
+    db.Execute "CREATE TABLE tmpJobAction (JobOrderID LONG CONSTRAINT PK_tmpJobAction PRIMARY KEY, ConsultNumber LONG, OrderDate DATETIME, LocationCode TEXT(20), JobStatus TEXT(40))", dbFailOnError
+End Sub
+
+Private Sub RebuildJobKey(ByVal db As DAO.Database)
+    DropTableIfExists db, "tmpJobKey"
+    DropTableIfExists db, "tmpJobKeyByPO"
+    db.Execute "CREATE TABLE tmpJobKey (JobOrderID LONG CONSTRAINT PK_tmpJobKey PRIMARY KEY, ConsultNumber LONG, PONumber TEXT(50))", dbFailOnError
+    db.Execute "INSERT INTO tmpJobKey (JobOrderID,ConsultNumber,PONumber) SELECT JobOrderID,Nz(ConsultNumber,0),Left(Nz(PONumber,''),50) FROM JobOrder", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpJobKey_PO ON tmpJobKey (PONumber)", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpJobKey_Consult ON tmpJobKey (ConsultNumber)", dbFailOnError
+    db.Execute "CREATE TABLE tmpJobKeyByPO (PONumber TEXT(50) CONSTRAINT PK_tmpJobKeyByPO PRIMARY KEY, JobOrderID LONG)", dbFailOnError
+    db.Execute "INSERT INTO tmpJobKeyByPO (PONumber,JobOrderID) SELECT PONumber,Max(JobOrderID) FROM tmpJobKey WHERE Len(PONumber)>0 GROUP BY PONumber", dbFailOnError
+End Sub
+
+Private Sub RefreshJobKey(ByVal db As DAO.Database)
+    db.Execute "DELETE FROM tmpJobKey", dbFailOnError
+    db.Execute "INSERT INTO tmpJobKey (JobOrderID,ConsultNumber,PONumber) SELECT JobOrderID,Nz(ConsultNumber,0),Left(Nz(PONumber,''),50) FROM JobOrder", dbFailOnError
+    db.Execute "DELETE FROM tmpJobKeyByPO", dbFailOnError
+    db.Execute "INSERT INTO tmpJobKeyByPO (PONumber,JobOrderID) SELECT PONumber,Max(JobOrderID) FROM tmpJobKey WHERE Len(PONumber)>0 GROUP BY PONumber", dbFailOnError
+End Sub
+
+Private Sub BuildShipmentWork(ByVal db As DAO.Database)
+    db.Execute "CREATE TABLE tmpShippingSource (PONumber TEXT(50), ShippedDate DATETIME, InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "INSERT INTO tmpShippingSource (PONumber,ShippedDate,InvoiceNumber,FrameName,LensDescription) " & _
+               "SELECT Left(Trim(Nz([P#O#],'')),50),[Date Shipped],Nz([Invoice Number],0),Max([Frame Name]),Max([Lens Description]) FROM [" & T_SHIPPING & "] " & _
+               "WHERE Len(Trim(Nz([P#O#],'')))>0 AND [Date Shipped]>=DateAdd('yyyy',-1,Date()) GROUP BY Left(Trim(Nz([P#O#],'')),50),[Date Shipped],Nz([Invoice Number],0)", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpShippingSource_PO ON tmpShippingSource (PONumber)", dbFailOnError
+
+    db.Execute "CREATE TABLE tmpTrackingSource (PONumber TEXT(50), ShippedDate DATETIME, TrackingNumber TEXT(255), InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "INSERT INTO tmpTrackingSource (PONumber,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription) " & _
+               "SELECT Left(Trim(Nz([PO],'')),50),CDate([Ship Date]),Left(Max(Nz([Tracking],'')),255),Val(Nz([Invoice],'0')),Max([Frame]),Max([Lens Description]) FROM [" & T_TRACKING & "] " & _
+               "WHERE Len(Trim(Nz([PO],'')))>0 AND IsDate([Ship Date]) GROUP BY Left(Trim(Nz([PO],'')),50),CDate([Ship Date]),Val(Nz([Invoice],'0'))", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpTrackingSource_PO ON tmpTrackingSource (PONumber)", dbFailOnError
+
+    db.Execute "CREATE TABLE tmpShipmentAction (ActionKey TEXT(150) CONSTRAINT PK_tmpShipmentAction PRIMARY KEY, JobOrderID LONG, PONumber TEXT(50), ShippedDate DATETIME, TrackingNumber TEXT(255), InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpShipmentAction_Job ON tmpShipmentAction (JobOrderID)", dbFailOnError
+    db.Execute "CREATE TABLE tmpShipmentKey (ShipmentID LONG CONSTRAINT PK_tmpShipmentKey PRIMARY KEY, ActionKey TEXT(150), JobOrderID LONG)", dbFailOnError
+    ' The numeric JobOrderKey is populated later through a direct back-end connection.
+    ' Do not reference it through the linked table here: an existing Access link can
+    ' retain its old field list immediately after the compatibility ALTER TABLE.
+    db.Execute "INSERT INTO tmpShipmentKey (ShipmentID,ActionKey,JobOrderID) SELECT ShipmentID,UCase(Left(Nz(JobOrderID,''),50)) & '|' & Format(ShippedDate,'yyyymmdd') & '|' & CStr(Nz([Invoice Number],0)),0 FROM ShipmentTracking WHERE JobOrderID Is Not Null AND ShippedDate>=DateAdd('yyyy',-1,Date())", dbFailOnError
+    db.Execute "CREATE INDEX IX_tmpShipmentKey_Action ON tmpShipmentKey (ActionKey)", dbFailOnError
+    db.Execute "CREATE TABLE tmpTrackingMatched (ActionKey TEXT(150) CONSTRAINT PK_tmpTrackingMatched PRIMARY KEY, JobOrderID LONG, PONumber TEXT(50), ShippedDate DATETIME, TrackingNumber TEXT(255), InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "CREATE TABLE tmpShipmentNew (PONumber TEXT(50), JobOrderID LONG, ShippedDate DATETIME, TrackingNumber TEXT(255), InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "CREATE TABLE tmpShipmentUpdate (ShipmentID LONG CONSTRAINT PK_tmpShipmentUpdate PRIMARY KEY, JobOrderID LONG, TrackingNumber TEXT(255), FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    db.Execute "CREATE TABLE tmpJobClose (JobOrderID LONG CONSTRAINT PK_tmpJobClose PRIMARY KEY, ClosedDate DATETIME)", dbFailOnError
+End Sub
+
+Private Function CommitConsults(ByVal db As DAO.Database) As Long
+    Dim changed As Long
+    db.Execute "INSERT INTO Consult (ConsultNumber,PatientDisplay,[Last 5],CreatedDate,ServiceName,ConsultStatus,County,Urgency,OrderingProvider,LastAction,LastActionDate,AppointmentDate,AppointmentClinic,ContactAttempts,LetterSentDate,LastContactDate,DocumentationRequests) " & _
+               "SELECT S.ConsultNumber,S.PatientDisplay,S.Last5,S.CreatedDate,S.ServiceName,S.ConsultStatus,S.County,S.Urgency,S.OrderingProvider,S.LastAction,S.LastActionDate,S.AppointmentDate,S.AppointmentClinic,S.ContactAttempts,S.LetterSentDate,S.LastContactDate,S.DocumentationRequests " & _
+               "FROM tmpConsultSource AS S LEFT JOIN tmpConsultKey AS K ON S.ConsultNumber=K.ConsultNumber WHERE K.ConsultNumber Is Null", dbFailOnError
+    changed = changed + db.RecordsAffected
+    db.Execute "UPDATE Consult AS C INNER JOIN tmpConsultSource AS S ON C.ConsultNumber=S.ConsultNumber SET C.PatientDisplay=S.PatientDisplay,C.[Last 5]=S.Last5,C.CreatedDate=S.CreatedDate,C.ServiceName=S.ServiceName,C.ConsultStatus=S.ConsultStatus,C.County=S.County,C.Urgency=S.Urgency,C.OrderingProvider=S.OrderingProvider,C.LastAction=S.LastAction,C.LastActionDate=S.LastActionDate,C.AppointmentDate=S.AppointmentDate,C.AppointmentClinic=S.AppointmentClinic,C.ContactAttempts=S.ContactAttempts,C.LetterSentDate=S.LetterSentDate,C.LastContactDate=S.LastContactDate,C.DocumentationRequests=S.DocumentationRequests", dbFailOnError
+    changed = changed + db.RecordsAffected
+    CommitConsults = changed
+End Function
+
+Private Function CommitJobOrders(ByVal db As DAO.Database) As Long
+    Dim changed As Long
+    db.Execute "INSERT INTO JobOrder (ConsultNumber,OrderDate,PONumber,LocationCode,JobStatus) SELECT S.ConsultNumber,S.OrderDate,S.PONumber,S.LocationCode,S.JobStatus FROM tmpJobSource AS S LEFT JOIN tmpJobKeyByPO AS K ON S.PONumber=K.PONumber WHERE K.JobOrderID Is Null", dbFailOnError
+    changed = changed + db.RecordsAffected
+    RefreshJobKey db
+    db.Execute "DELETE FROM tmpJobAction", dbFailOnError
+    db.Execute "INSERT INTO tmpJobAction (JobOrderID,ConsultNumber,OrderDate,LocationCode,JobStatus) SELECT K.JobOrderID,S.ConsultNumber,S.OrderDate,S.LocationCode,S.JobStatus FROM tmpJobSource AS S INNER JOIN tmpJobKeyByPO AS K ON S.PONumber=K.PONumber", dbFailOnError
+    db.Execute "UPDATE JobOrder AS J INNER JOIN tmpJobAction AS A ON J.JobOrderID=A.JobOrderID SET J.ConsultNumber=IIf(A.ConsultNumber Is Null OR A.ConsultNumber=0,J.ConsultNumber,A.ConsultNumber),J.OrderDate=Nz(A.OrderDate,J.OrderDate),J.LocationCode=IIf(Len(Nz(A.LocationCode,''))=0,J.LocationCode,A.LocationCode),J.JobStatus=IIf(Len(Nz(A.JobStatus,''))=0,J.JobStatus,A.JobStatus)", dbFailOnError
+    changed = changed + db.RecordsAffected
+    CommitJobOrders = changed
+End Function
+
+Private Function CommitShipments(ByVal db As DAO.Database) As Long
+    Dim changed As Long
+    ' Full Shipping snapshot: match normalized, indexed local Short Text fields.
+    db.Execute "INSERT INTO tmpShipmentAction (ActionKey,JobOrderID,PONumber,ShippedDate,InvoiceNumber,FrameName,LensDescription) " & _
+               "SELECT UCase(S.PONumber) & '|' & Format(S.ShippedDate,'yyyymmdd') & '|' & CStr(Nz(S.InvoiceNumber,0)),K.JobOrderID,S.PONumber,S.ShippedDate,S.InvoiceNumber,S.FrameName,S.LensDescription " & _
+               "FROM tmpShippingSource AS S INNER JOIN tmpJobKeyByPO AS K ON S.PONumber=K.PONumber", dbFailOnError
+
+    ' Pre-match the smaller Tracking snapshot once, then update by indexed ActionKey.
+    db.Execute "DELETE FROM tmpTrackingMatched", dbFailOnError
+    db.Execute "INSERT INTO tmpTrackingMatched (ActionKey,JobOrderID,PONumber,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription) " & _
+               "SELECT UCase(S.PONumber) & '|' & Format(S.ShippedDate,'yyyymmdd') & '|' & CStr(Nz(S.InvoiceNumber,0)),K.JobOrderID,S.PONumber,S.ShippedDate,Max(S.TrackingNumber),S.InvoiceNumber,Max(S.FrameName),Max(S.LensDescription) " & _
+               "FROM tmpTrackingSource AS S INNER JOIN tmpJobKeyByPO AS K ON S.PONumber=K.PONumber GROUP BY K.JobOrderID,S.PONumber,S.ShippedDate,S.InvoiceNumber", dbFailOnError
+    db.Execute "INSERT INTO tmpShipmentAction (ActionKey,JobOrderID,PONumber,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription) " & _
+               "SELECT M.ActionKey,M.JobOrderID,M.PONumber,M.ShippedDate,M.TrackingNumber,M.InvoiceNumber,M.FrameName,M.LensDescription FROM tmpTrackingMatched AS M LEFT JOIN tmpShipmentAction AS A ON M.ActionKey=A.ActionKey WHERE A.ActionKey Is Null", dbFailOnError
+    db.Execute "UPDATE tmpShipmentAction AS A INNER JOIN tmpTrackingMatched AS M ON A.ActionKey=M.ActionKey SET A.TrackingNumber=IIf(Len(Nz(M.TrackingNumber,''))=0,A.TrackingNumber,M.TrackingNumber),A.FrameName=IIf(Len(Nz(M.FrameName,''))=0,A.FrameName,M.FrameName),A.LensDescription=IIf(Len(Nz(M.LensDescription,''))=0,A.LensDescription,M.LensDescription)", dbFailOnError
+
+    db.Execute "DELETE FROM tmpShipmentNew", dbFailOnError
+    db.Execute "INSERT INTO tmpShipmentNew (PONumber,JobOrderID,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription) SELECT A.PONumber,A.JobOrderID,A.ShippedDate,A.TrackingNumber,A.InvoiceNumber,A.FrameName,A.LensDescription FROM tmpShipmentAction AS A LEFT JOIN tmpShipmentKey AS K ON A.ActionKey=K.ActionKey WHERE K.ShipmentID Is Null", dbFailOnError
+    db.Execute "DELETE FROM tmpShipmentUpdate", dbFailOnError
+    db.Execute "INSERT INTO tmpShipmentUpdate (ShipmentID,JobOrderID,TrackingNumber,FrameName,LensDescription) SELECT K.ShipmentID,A.JobOrderID,A.TrackingNumber,A.FrameName,A.LensDescription FROM tmpShipmentAction AS A INNER JOIN tmpShipmentKey AS K ON A.ActionKey=K.ActionKey", dbFailOnError
+    db.Execute "DELETE FROM tmpJobClose", dbFailOnError
+    db.Execute "INSERT INTO tmpJobClose (JobOrderID,ClosedDate) SELECT JobOrderID,Max(ShippedDate) FROM tmpShipmentAction GROUP BY JobOrderID", dbFailOnError
+    changed = changed + ApplyShipmentChangesInBackend(db)
+    CommitShipments = changed
+End Function
+
+Private Function ApplyShipmentChangesInBackend(ByVal db As DAO.Database) As Long
+    Const LINK_NEW As String = "zzOpsShipmentNew"
+    Const LINK_UPDATE As String = "zzOpsShipmentUpdate"
+    Const LINK_CLOSE As String = "zzOpsJobClose"
+    Const TABLE_NEW As String = "zstgShipmentNew"
+    Const TABLE_UPDATE As String = "zstgShipmentUpdate"
+    Const TABLE_CLOSE As String = "zstgJobClose"
+    Dim ops As DAO.Database, tdf As DAO.TableDef, sourcePath As String
+    Dim savedNumber As Long, savedDescription As String, changed As Long
+    On Error GoTo Failed
+    sourcePath = OperationsBackendPath(db)
+    DropTableIfExists db, LINK_NEW
+    DropTableIfExists db, LINK_UPDATE
+    DropTableIfExists db, LINK_CLOSE
+    Set ops = DBEngine.OpenDatabase(sourcePath, False)
+    On Error Resume Next
+    ops.TableDefs.Delete TABLE_NEW
+    ops.TableDefs.Delete TABLE_UPDATE
+    ops.TableDefs.Delete TABLE_CLOSE
+    On Error GoTo Failed
+    ops.Execute "CREATE TABLE " & TABLE_NEW & " (LegacyPO TEXT(50), JobOrderKey LONG, ShippedDate DATETIME, TrackingNumber TEXT(255), InvoiceNumber DOUBLE, FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    ops.Execute "CREATE TABLE " & TABLE_UPDATE & " (ShipmentID LONG CONSTRAINT PK_zstgShipmentUpdate PRIMARY KEY, JobOrderKey LONG, TrackingNumber TEXT(255), FrameName TEXT(255), LensDescription TEXT(255))", dbFailOnError
+    ops.Execute "CREATE TABLE " & TABLE_CLOSE & " (JobOrderID LONG CONSTRAINT PK_zstgJobClose PRIMARY KEY, ClosedDate DATETIME)", dbFailOnError
+    ops.Close
+
+    Set tdf = db.CreateTableDef(LINK_NEW)
+    tdf.Connect = ";DATABASE=" & sourcePath: tdf.SourceTableName = TABLE_NEW
+    db.TableDefs.Append tdf
+    Set tdf = db.CreateTableDef(LINK_UPDATE)
+    tdf.Connect = ";DATABASE=" & sourcePath: tdf.SourceTableName = TABLE_UPDATE
+    db.TableDefs.Append tdf
+    Set tdf = db.CreateTableDef(LINK_CLOSE)
+    tdf.Connect = ";DATABASE=" & sourcePath: tdf.SourceTableName = TABLE_CLOSE
+    db.TableDefs.Append tdf
+    db.Execute "INSERT INTO " & LINK_NEW & " (LegacyPO,JobOrderKey,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription) SELECT PONumber,JobOrderID,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription FROM tmpShipmentNew", dbFailOnError
+    db.Execute "INSERT INTO " & LINK_UPDATE & " (ShipmentID,JobOrderKey,TrackingNumber,FrameName,LensDescription) SELECT ShipmentID,JobOrderID,TrackingNumber,FrameName,LensDescription FROM tmpShipmentUpdate", dbFailOnError
+    db.Execute "INSERT INTO " & LINK_CLOSE & " (JobOrderID,ClosedDate) SELECT JobOrderID,ClosedDate FROM tmpJobClose", dbFailOnError
+    db.TableDefs.Delete LINK_NEW
+    db.TableDefs.Delete LINK_UPDATE
+    db.TableDefs.Delete LINK_CLOSE
+
+    Set ops = DBEngine.OpenDatabase(sourcePath, False)
+    ops.Execute "INSERT INTO ShipmentTracking (JobOrderID,JobOrderKey,ShippedDate,TrackingNumber,[Invoice Number],[Frame Name],[Lens Description]) SELECT LegacyPO,JobOrderKey,ShippedDate,TrackingNumber,InvoiceNumber,FrameName,LensDescription FROM " & TABLE_NEW, dbFailOnError
+    changed = changed + ops.RecordsAffected
+    ops.Execute "UPDATE ShipmentTracking AS T INNER JOIN " & TABLE_UPDATE & " AS U ON T.ShipmentID=U.ShipmentID SET T.JobOrderKey=U.JobOrderKey,T.TrackingNumber=IIf(U.TrackingNumber Is Null OR U.TrackingNumber='',T.TrackingNumber,U.TrackingNumber),T.[Frame Name]=IIf(U.FrameName Is Null OR U.FrameName='',T.[Frame Name],U.FrameName),T.[Lens Description]=IIf(U.LensDescription Is Null OR U.LensDescription='',T.[Lens Description],U.LensDescription)", dbFailOnError
+    changed = changed + ops.RecordsAffected
+    ops.Execute "UPDATE JobOrder AS J INNER JOIN " & TABLE_CLOSE & " AS C ON J.JobOrderID=C.JobOrderID SET J.ClosedDate=C.ClosedDate,J.JobStatus='Closed'", dbFailOnError
+    changed = changed + ops.RecordsAffected
+    ops.TableDefs.Delete TABLE_NEW
+    ops.TableDefs.Delete TABLE_UPDATE
+    ops.TableDefs.Delete TABLE_CLOSE
+    ops.Close
+    ApplyShipmentChangesInBackend = changed
+    Exit Function
+Failed:
+    savedNumber = Err.Number: savedDescription = Err.Description
+    On Error Resume Next
+    db.TableDefs.Delete LINK_NEW
+    db.TableDefs.Delete LINK_UPDATE
+    db.TableDefs.Delete LINK_CLOSE
+    If Not ops Is Nothing Then
+        ops.TableDefs.Delete TABLE_NEW
+        ops.TableDefs.Delete TABLE_UPDATE
+        ops.TableDefs.Delete TABLE_CLOSE
+        ops.Close
+    End If
+    Err.Raise savedNumber, , savedDescription
+End Function
+
+Private Sub WriteAudit(ByVal db As DAO.Database, ByVal runID As Long, ByVal sourceRows As Long, ByVal acceptedRows As Long, ByVal rejectedRows As Long)
+    Dim sourceFile As String
+    sourceFile = Nz(DLookup("SourceFile", "ImportRun", "ImportRunID=" & runID), "")
+    db.Execute "INSERT INTO ImportAudit (ImportedAt,ImportType,SourceFile,SourceRows,AcceptedRows,RejectedRows,Detail) VALUES (Now(),'JobTracking full snapshot','" & SqlText(sourceFile) & "'," & sourceRows & "," & acceptedRows & "," & rejectedRows & ",'Bulk indexed import; staging retained locally')", dbFailOnError
+End Sub
+
+Private Sub DropWorkTables(ByVal db As DAO.Database)
+    Dim n As Variant
+    For Each n In Array("tmpConsultSource", "tmpConsultKey", "tmpJobSource", "tmpJobKey", "tmpJobKeyByPO", "tmpJobAction", "tmpShippingSource", "tmpTrackingSource", "tmpTrackingMatched", "tmpShipmentAction", "tmpShipmentKey", "tmpShipmentNew", "tmpShipmentUpdate", "tmpJobClose")
+        DropTableIfExists db, CStr(n)
+    Next n
+End Sub
+
+Private Sub DropTableIfExists(ByVal db As DAO.Database, ByVal tableName As String)
+    On Error Resume Next
+    db.TableDefs.Delete tableName
+    On Error GoTo 0
+End Sub
+
+Private Function TableExists(ByVal db As DAO.Database, ByVal tableName As String) As Boolean
+    On Error Resume Next
+    TableExists = (Len(db.TableDefs(tableName).Name) > 0)
+    On Error GoTo 0
+End Function
+
+Private Sub RequireTable(ByVal db As DAO.Database, ByVal tableName As String)
+    If Not TableExists(db, tableName) Then Err.Raise vbObjectError + 1210, , "Required staged table is missing: " & tableName
+End Sub
+
+Private Sub RequireField(ByVal db As DAO.Database, ByVal tableName As String, ByVal fieldName As String)
+    On Error GoTo Missing
+    Dim testName As String
+    testName = db.TableDefs(tableName).Fields(fieldName).Name
+    Exit Sub
+Missing:
+    Err.Raise vbObjectError + 1211, , "Required field is missing: " & tableName & "." & fieldName
+End Sub
+
+Private Function RowCount(ByVal db As DAO.Database, ByVal tableName As String) As Long
+    RowCount = Nz(DCount("*", "[" & tableName & "]"), 0)
+End Function
+
+Private Function SqlText(ByVal value As String) As String
+    SqlText = Replace(value, "'", "''")
+End Function
